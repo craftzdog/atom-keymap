@@ -4,9 +4,10 @@ fs = require 'fs-plus'
 path = require 'path'
 {File} = require 'pathwatcher'
 {Emitter, Disposable, CompositeDisposable} = require 'event-kit'
-KeyBinding = require './key-binding'
+{KeyBinding, MATCH_TYPES} = require './key-binding'
 CommandEvent = require './command-event'
-{normalizeKeystrokes, keystrokeForKeyboardEvent, isAtomModifier, keydownEvent, keyupEvent, characterForKeyboardEvent, keystrokesMatch} = require './helpers'
+{normalizeKeystrokes, keystrokeForKeyboardEvent, isBareModifier, keydownEvent, keyupEvent, characterForKeyboardEvent, keystrokesMatch, isKeyup} = require './helpers'
+PartialKeyupMatcher = require './partial-keyup-matcher'
 
 Platforms = ['darwin', 'freebsd', 'linux', 'sunos', 'win32']
 OtherPlatforms = Platforms.filter (platform) -> platform isnt process.platform
@@ -92,7 +93,10 @@ class KeymapManager
   defaultTarget: null
   pendingPartialMatches: null
   pendingStateTimeoutHandle: null
-  dvorakQwertyWorkaroundEnabled: false
+
+  # Pending matches to bindings that begin with keydowns and end with a subset
+  # of matching keyups
+  pendingKeyupMatcher: new PartialKeyupMatcher()
 
   ###
   Section: Construction and Destruction
@@ -108,6 +112,7 @@ class KeymapManager
   constructor: (options={}) ->
     @[key] = value for key, value of options
     @watchSubscriptions = {}
+    @customKeystrokeResolvers = []
     @clear()
 
   # Public: Clear all registered key bindings and enqueued keystrokes. For use
@@ -121,7 +126,6 @@ class KeymapManager
 
   # Public: Unwatch all watched paths.
   destroy: ->
-    @keyboardLayoutSubscription.dispose()
     for filePath, subscription of @watchSubscriptions
       subscription.dispose()
 
@@ -218,12 +222,16 @@ class KeymapManager
   #   keystroke patterns to commands.
   # * `priority` A {Number} used to sort keybindings which have the same
   #   specificity. Defaults to `0`.
-  add: (source, keyBindingsBySelector, priority=0) ->
+  add: (source, keyBindingsBySelector, priority=0, throwOnInvalidSelector=true) ->
     addedKeyBindings = []
     for selector, keyBindings of keyBindingsBySelector
       # Verify selector is valid before registering any bindings
-      unless isSelectorValid(selector.replace(/!important/g, ''))
+      if throwOnInvalidSelector and not isSelectorValid(selector.replace(/!important/g, ''))
         console.warn("Encountered an invalid selector adding key bindings from '#{source}': '#{selector}'")
+        return
+
+      unless typeof keyBindings is 'object'
+        console.warn("Encountered an invalid key binding when adding key bindings from '#{source}' '#{keyBindings}'")
         return
 
       for keystrokes, command of keyBindings
@@ -361,13 +369,13 @@ class KeymapManager
   readKeymap: (filePath, suppressErrors) ->
     if suppressErrors
       try
-        CSON.readFileSync(filePath)
+        CSON.readFileSync(filePath, allowDuplicateKeys: false)
       catch error
         console.warn("Failed to reload key bindings file: #{filePath}", error.stack ? error)
         @emitter.emit 'did-fail-to-read-file', error
         undefined
     else
-      CSON.readFileSync(filePath)
+      CSON.readFileSync(filePath, allowDuplicateKeys: false)
 
   # Determine if the given path should be loaded on this platform. If the
   # filename has the pattern '<platform>.cson' or 'foo.<platform>.cson' and
@@ -484,10 +492,18 @@ class KeymapManager
     #
     # Godspeed.
 
+    # When a keyboard event is part of IME composition, the keyCode is always
+    # 229, which is the "composition key code". This API is deprecated, but this
+    # is the most simple and reliable way we found to ignore keystrokes that are
+    # part of IME compositions.
+    if event.keyCode is 229 and event.key isnt 'Dead'
+      return
+
+    # keystroke is the atom keybind syntax, e.g. 'ctrl-a'
     keystroke = @keystrokeForKeyboardEvent(event)
 
     # We dont care about bare modifier keys in the bindings. e.g. `ctrl y` isnt going to work.
-    if event.type is 'keydown' and @queuedKeystrokes.length > 0 and isAtomModifier(keystroke)
+    if event.type is 'keydown' and @queuedKeystrokes.length > 0 and isBareModifier(keystroke)
       event.preventDefault()
       return
 
@@ -503,7 +519,7 @@ class KeymapManager
     # First screen for any bindings that match the current keystrokes,
     # regardless of their current selector. Matching strings is cheaper than
     # matching selectors.
-    {partialMatchCandidates, keydownExactMatchCandidates, exactMatchCandidates} = @findMatchCandidates(@queuedKeystrokes, disabledBindings)
+    {partialMatchCandidates, pendingKeyupMatchCandidates, exactMatchCandidates} = @findMatchCandidates(@queuedKeystrokes, disabledBindings)
     dispatchedExactMatch = null
     partialMatches = @findPartialMatches(partialMatchCandidates, target)
 
@@ -518,8 +534,11 @@ class KeymapManager
     hasPartialMatches = partialMatches.length > 0
     shouldUsePartialMatches = hasPartialMatches
 
+    if isKeyup(keystroke)
+      exactMatchCandidates = exactMatchCandidates.concat(@pendingKeyupMatcher.getMatches(keystroke))
+
     # Determine if the current keystrokes match any bindings *exactly*. If we
-    # do find and exact match, the next step depends on whether we have any
+    # do find an exact match, the next step depends on whether we have any
     # partial matches. If we have no partial matches, we dispatch the command
     # immediately. Otherwise we break and allow ourselves to enter the pending
     # state with a timeout.
@@ -546,11 +565,16 @@ class KeymapManager
           if hasPartialMatches
             # When there is a set of bindings like `'ctrl-y', 'ctrl-y ^ctrl'`,
             # and a `ctrl-y` comes in, this will allow the `ctrl-y` command to be
-            # dispatched without waiting for any other keystrokes
+            # dispatched without waiting for any other keystrokes.
             allPartialMatchesContainKeyupRemainder = true
             for partialMatch in partialMatches
-              if keydownExactMatchCandidates.indexOf(partialMatch) < 0
+              if pendingKeyupMatchCandidates.indexOf(partialMatch) < 0
                 allPartialMatchesContainKeyupRemainder = false
+                # We found one partial match with unmatched keydowns.
+                # We can stop looking.
+                break
+            # Don't dispatch this exact match. There are partial matches left
+            # that have keydowns.
             break if allPartialMatchesContainKeyupRemainder is false
           else
             shouldUsePartialMatches = false
@@ -558,6 +582,8 @@ class KeymapManager
           if @dispatchCommandEvent(exactMatchCandidate.command, target, event)
             dispatchedExactMatch = exactMatchCandidate
             eventHandled = true
+            for pendingKeyupMatch in pendingKeyupMatchCandidates
+              @pendingKeyupMatcher.addPendingMatch(pendingKeyupMatch)
             break
         currentTarget = currentTarget.parentElement
 
@@ -617,7 +643,31 @@ class KeymapManager
   #
   # Returns a {String} describing the keystroke.
   keystrokeForKeyboardEvent: (event) ->
-    keystrokeForKeyboardEvent(event, @dvorakQwertyWorkaroundEnabled)
+    keystrokeForKeyboardEvent(event, @customKeystrokeResolvers)
+
+  # Public: Customize translation of raw keyboard events to keystroke strings.
+  # This API is useful for working around Chrome bugs or changing how Atom
+  # resolves certain key combinations. If multiple resolvers are installed,
+  # the most recently-added resolver returning a string for a given keystroke
+  # takes precedence.
+  #
+  # * `resolver` A {Function} that returns a keystroke {String} and is called
+  #    with an object containing the following keys:
+  #    * `keystroke` The currently resolved keystroke string. If your function
+  #      returns a falsy value, this is how Atom will resolve your keystroke.
+  #    * `event` The raw DOM 3 `KeyboardEvent` being resolved. See the DOM API
+  #      documentation for more details.
+  #    * `layoutName` The OS-specific name of the current keyboard layout.
+  #    * `keymap` An object mapping DOM 3 `KeyboardEvent.code` values to objects
+  #      with the typed character for that key in each modifier state, based on
+  #      the current operating system layout.
+  #
+  # Returns a {Disposable} that removes the added resolver.
+  addKeystrokeResolver: (resolver) ->
+    @customKeystrokeResolvers.push(resolver)
+    new Disposable =>
+      index = @customKeystrokeResolvers.indexOf(resolver)
+      @customKeystrokeResolvers.splice(index, 1) if index >= 0
 
   # Public: Get the number of milliseconds allowed before pending states caused
   # by partial matches of multi-keystroke bindings are terminated.
@@ -631,7 +681,7 @@ class KeymapManager
   ###
 
   simulateTextInput: (keydownEvent) ->
-    if character = characterForKeyboardEvent(keydownEvent, @dvorakQwertyWorkaroundEnabled)
+    if character = characterForKeyboardEvent(keydownEvent)
       textInputEvent = document.createEvent("TextEvent")
       textInputEvent.initTextEvent("textInput", true, true, window, character)
       keydownEvent.path[0].dispatchEvent(textInputEvent)
@@ -644,19 +694,19 @@ class KeymapManager
   findMatchCandidates: (keystrokeArray, disabledBindings) ->
     partialMatchCandidates = []
     exactMatchCandidates = []
-    keydownExactMatchCandidates = []
+    pendingKeyupMatchCandidates = []
     disabledBindingSet = new Set(disabledBindings)
 
     for binding in @keyBindings when not disabledBindingSet.has(binding)
-      doesMatch = keystrokesMatch(binding.keystrokeArray, keystrokeArray)
-      if doesMatch is 'exact'
+      doesMatch = binding.matchesKeystrokes(keystrokeArray)
+      if doesMatch is MATCH_TYPES.EXACT
         exactMatchCandidates.push(binding)
-      else if doesMatch is 'partial'
+      else if doesMatch is MATCH_TYPES.PARTIAL
         partialMatchCandidates.push(binding)
-      else if doesMatch is 'keydownExact'
+      else if doesMatch is MATCH_TYPES.PENDING_KEYUP
         partialMatchCandidates.push(binding)
-        keydownExactMatchCandidates.push(binding)
-    {partialMatchCandidates, keydownExactMatchCandidates, exactMatchCandidates}
+        pendingKeyupMatchCandidates.push(binding)
+    {partialMatchCandidates, pendingKeyupMatchCandidates, exactMatchCandidates}
 
   # Determine which of the given bindings have selectors matching the target or
   # one of its ancestors. This is used by {::handleKeyboardEvent} to determine
@@ -712,7 +762,7 @@ class KeymapManager
   #
   # Note that replaying events has a recursive behavior. Replaying will set
   # member state (e.g. @queuedKeyboardEvents) just like real events, and will
-  # likely result in another call this function. The replay process will
+  # likely result in another call to this function. The replay process will
   # potentially replay the events (or a subset of events) several times, while
   # disabling bindings here and there. See any spec that handles multiple
   # keystrokes failures to match a binding.
